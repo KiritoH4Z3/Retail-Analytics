@@ -4,7 +4,6 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from datetime import datetime
 import sqlite3
-import os
 
 # ─── Database Setup ───────────────────────────────────────────────────────────
 
@@ -42,7 +41,6 @@ def save_event(event):
     conn.commit()
     conn.close()
 
-# Initialize database
 init_db()
 
 # ─── Model & Tracker ──────────────────────────────────────────────────────────
@@ -80,41 +78,36 @@ ZONES = {
     ], np.int32)
 }
 
-ZONE_COLORS = {
-    "Entrance":         (0, 255, 0),
-    "Checkout Counter": (0, 165, 255),
-    "Center Aisle":     (255, 255, 0),
-    "Back Aisle":       (255, 0, 255),
-    "Right Aisle":      (0, 0, 255)
-}
-
 # ─── State ────────────────────────────────────────────────────────────────────
 
 active_dwells = {}
-dwell_events = []
+dwell_events  = []
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_center(l, t, r, b):
     return (int((l + r) / 2), int((t + b) / 2))
 
-def draw_zones(frame):
-    overlay = frame.copy()
-    for zone_name, polygon in ZONES.items():
-        color = ZONE_COLORS[zone_name]
-        cv2.fillPoly(overlay, [polygon], color)
-        cv2.polylines(frame, [polygon], True, color, 2)
-        M = cv2.moments(polygon.astype(np.float32))
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            cv2.putText(frame, zone_name, (cx - 40, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
-    cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-
 def log_event(event):
     dwell_events.append(event)
     save_event(event)
+
+def draw_hud(frame, event_count):
+    hud = f"Zone Events Logged: {event_count}"
+    (tw, th), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(frame, (8, 8), (tw + 16, th + 16), (0, 0, 0), -1)
+    cv2.putText(frame, hud, (12, th + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+def draw_person(frame, l, t, r, b, track_id, current_zone):
+    cv2.rectangle(frame, (l, t), (r, b), (255, 255, 255), 1)
+    label = f"ID {track_id}"
+    if current_zone:
+        label += f"  |  {current_zone}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    cv2.rectangle(frame, (l, t - th - 8), (l + tw + 6, t), (0, 0, 0), -1)
+    cv2.putText(frame, label, (l + 3, t - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
@@ -127,6 +120,7 @@ while cap.isOpened():
 
     now = datetime.now()
 
+    # Detection
     results = model(frame, classes=[0], verbose=False)
 
     detections = []
@@ -139,9 +133,8 @@ while cap.isOpened():
         h = y2 - y1
         detections.append(([x1, y1, w, h], conf, 'person'))
 
+    # Tracking
     tracks = tracker.update_tracks(detections, frame=frame)
-
-    draw_zones(frame)
 
     current_ids = set()
 
@@ -154,12 +147,14 @@ while cap.isOpened():
         l, t, r, b = map(int, track.to_ltrb())
         center = get_center(l, t, r, b)
 
+        # Zone detection
         current_zone = None
         for zone_name, polygon in ZONES.items():
             if cv2.pointPolygonTest(polygon, center, False) >= 0:
                 current_zone = zone_name
                 break
 
+        # Dwell logic
         if track_id not in active_dwells:
             active_dwells[track_id] = {}
 
@@ -167,27 +162,22 @@ while cap.isOpened():
             if current_zone not in active_dwells[track_id]:
                 active_dwells[track_id][current_zone] = now
 
+        # Zone exit detection
         for zone_name in list(active_dwells[track_id].keys()):
             if zone_name != current_zone:
-                entry_time = active_dwells[track_id][zone_name]
+                entry_time    = active_dwells[track_id][zone_name]
                 dwell_seconds = (now - entry_time).total_seconds()
                 if dwell_seconds > 1:
                     log_event({
-                        "track_id": track_id,
-                        "zone": zone_name,
-                        "entry_time": entry_time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "exit_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "track_id":      track_id,
+                        "zone":          zone_name,
+                        "entry_time":    entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_time":     now.strftime("%Y-%m-%d %H:%M:%S"),
                         "dwell_seconds": round(dwell_seconds, 2)
                     })
                 del active_dwells[track_id][zone_name]
 
-        cv2.rectangle(frame, (l, t), (r, b), (0, 255, 0), 2)
-        label = f"ID {track_id}"
-        if current_zone:
-            label += f" | {current_zone}"
-        cv2.putText(frame, label, (l, t - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
-        cv2.circle(frame, center, 4, (0, 255, 255), -1)
+        draw_person(frame, l, t, r, b, track_id, current_zone)
 
     # Handle lost tracks
     lost_ids = set(active_dwells.keys()) - current_ids
@@ -196,16 +186,15 @@ while cap.isOpened():
             dwell_seconds = (now - entry_time).total_seconds()
             if dwell_seconds > 1:
                 log_event({
-                    "track_id": track_id,
-                    "zone": zone_name,
-                    "entry_time": entry_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "exit_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "track_id":      track_id,
+                    "zone":          zone_name,
+                    "entry_time":    entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "exit_time":     now.strftime("%Y-%m-%d %H:%M:%S"),
                     "dwell_seconds": round(dwell_seconds, 2)
                 })
         del active_dwells[track_id]
 
-    cv2.putText(frame, f"Dwell Events: {len(dwell_events)}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    draw_hud(frame, len(dwell_events))
 
     cv2.imshow("Retail Zone Analytics", frame)
 
