@@ -3,11 +3,52 @@ import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from datetime import datetime
+import sqlite3
+import os
 
-# Load model
+# ─── Database Setup ───────────────────────────────────────────────────────────
+
+DB_PATH = r"C:\Retail-Analytics\Retail-Analytics\dwell_events.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS dwell_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id      INTEGER,
+            zone          TEXT,
+            entry_time    TEXT,
+            exit_time     TEXT,
+            dwell_seconds REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_event(event):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO dwell_events (track_id, zone, entry_time, exit_time, dwell_seconds)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        event["track_id"],
+        event["zone"],
+        event["entry_time"],
+        event["exit_time"],
+        event["dwell_seconds"]
+    ))
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+# ─── Model & Tracker ──────────────────────────────────────────────────────────
+
 model = YOLO("yolov8n.pt")
 
-# Initialize DeepSORT tracker
 tracker = DeepSort(
     max_age=70,
     n_init=10,
@@ -15,7 +56,8 @@ tracker = DeepSort(
     nms_max_overlap=0.5
 )
 
-# Zone definitions from your store layout
+# ─── Zone Definitions ─────────────────────────────────────────────────────────
+
 ZONES = {
     "Entrance": np.array([
         (2, 287), (123, 273), (296, 359), (4, 356), (3, 285)
@@ -38,20 +80,20 @@ ZONES = {
     ], np.int32)
 }
 
-# Zone colors (BGR)
 ZONE_COLORS = {
-    "Entrance":         (0, 255, 0),      # Green
-    "Checkout Counter": (0, 165, 255),    # Orange
-    "Center Aisle":     (255, 255, 0),    # Cyan
-    "Back Aisle":       (255, 0, 255),    # Magenta
-    "Right Aisle":      (0, 0, 255)       # Red
+    "Entrance":         (0, 255, 0),
+    "Checkout Counter": (0, 165, 255),
+    "Center Aisle":     (255, 255, 0),
+    "Back Aisle":       (255, 0, 255),
+    "Right Aisle":      (0, 0, 255)
 }
 
-# Dwell tracking
+# ─── State ────────────────────────────────────────────────────────────────────
+
 active_dwells = {}
 dwell_events = []
 
-cap = cv2.VideoCapture(r"C:\Retail-Analytics\Retail-Analytics\demo_video2.mp4")
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_center(l, t, r, b):
     return (int((l + r) / 2), int((t + b) / 2))
@@ -62,7 +104,6 @@ def draw_zones(frame):
         color = ZONE_COLORS[zone_name]
         cv2.fillPoly(overlay, [polygon], color)
         cv2.polylines(frame, [polygon], True, color, 2)
-        # Zone label at centroid
         M = cv2.moments(polygon.astype(np.float32))
         if M["m00"] != 0:
             cx = int(M["m10"] / M["m00"])
@@ -71,6 +112,14 @@ def draw_zones(frame):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
     cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
 
+def log_event(event):
+    dwell_events.append(event)
+    save_event(event)
+
+# ─── Main Loop ────────────────────────────────────────────────────────────────
+
+cap = cv2.VideoCapture(r"C:\Retail-Analytics\Retail-Analytics\demo_video2.mp4")
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -78,7 +127,6 @@ while cap.isOpened():
 
     now = datetime.now()
 
-    # Detection
     results = model(frame, classes=[0], verbose=False)
 
     detections = []
@@ -91,10 +139,8 @@ while cap.isOpened():
         h = y2 - y1
         detections.append(([x1, y1, w, h], conf, 'person'))
 
-    # Tracking
     tracks = tracker.update_tracks(detections, frame=frame)
 
-    # Draw zones
     draw_zones(frame)
 
     current_ids = set()
@@ -108,14 +154,12 @@ while cap.isOpened():
         l, t, r, b = map(int, track.to_ltrb())
         center = get_center(l, t, r, b)
 
-        # Zone detection
         current_zone = None
         for zone_name, polygon in ZONES.items():
             if cv2.pointPolygonTest(polygon, center, False) >= 0:
                 current_zone = zone_name
                 break
 
-        # Dwell logic
         if track_id not in active_dwells:
             active_dwells[track_id] = {}
 
@@ -123,13 +167,12 @@ while cap.isOpened():
             if current_zone not in active_dwells[track_id]:
                 active_dwells[track_id][current_zone] = now
 
-        # Zone exit detection
         for zone_name in list(active_dwells[track_id].keys()):
             if zone_name != current_zone:
                 entry_time = active_dwells[track_id][zone_name]
                 dwell_seconds = (now - entry_time).total_seconds()
                 if dwell_seconds > 1:
-                    dwell_events.append({
+                    log_event({
                         "track_id": track_id,
                         "zone": zone_name,
                         "entry_time": entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -138,7 +181,6 @@ while cap.isOpened():
                     })
                 del active_dwells[track_id][zone_name]
 
-        # Draw box and label
         cv2.rectangle(frame, (l, t), (r, b), (0, 255, 0), 2)
         label = f"ID {track_id}"
         if current_zone:
@@ -153,7 +195,7 @@ while cap.isOpened():
         for zone_name, entry_time in active_dwells[track_id].items():
             dwell_seconds = (now - entry_time).total_seconds()
             if dwell_seconds > 1:
-                dwell_events.append({
+                log_event({
                     "track_id": track_id,
                     "zone": zone_name,
                     "entry_time": entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -162,7 +204,6 @@ while cap.isOpened():
                 })
         del active_dwells[track_id]
 
-    # HUD
     cv2.putText(frame, f"Dwell Events: {len(dwell_events)}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
@@ -174,7 +215,8 @@ while cap.isOpened():
 cap.release()
 cv2.destroyAllWindows()
 
-# Terminal summary
+# ─── Terminal Summary ─────────────────────────────────────────────────────────
+
 print(f"\n--- Dwell Event Summary ---")
 print(f"Total events logged: {len(dwell_events)}")
 for event in dwell_events[-10:]:
