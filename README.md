@@ -50,11 +50,11 @@ From raw pixels to a manager's "aha" moment, the data flows in one direction:
 
 ```mermaid
 flowchart LR
-    A[📹 Store Video] --> B[🧠 YOLOv8n<br/>person detection<br/>conf ≥ 0.55]
-    B --> C[🔁 DeepSORT<br/>persistent track IDs]
-    C --> D[📐 Zone Polygons<br/>pointPolygonTest<br/>x5 zones]
-    D --> E[🗟️ SQLite<br/>dwell_events.db<br/>transits >1s only]
-    E --> F[📊 Streamlit Dashboard<br/>KPIs · scores · alerts]
+    A[Store Video] --> B[YOLOv8n<br/>person detection<br/>conf >= 0.55]
+    B --> C[DeepSORT<br/>persistent track IDs]
+    C --> D[Zone Polygons<br/>pointPolygonTest<br/>x5 zones]
+    D --> E[SQLite<br/>dwell_events.db<br/>transits >1s only]
+    E --> F[Streamlit Dashboard<br/>KPIs / scores / alerts]
 ```
 
 In plain English: **video → detect people → keep their IDs → figure out their zone → record the dwell → show the manager.**
